@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>深蹲姿态识别辅助系统</title>
+<style>
+  :root { --green:#2ea043; --gold:#e6a817; --red:#d93f3f; --bg:#101418; --panel:#1a2026; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: #e8edf2;
+    font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 10px;
+  }
+  h1 { font-size: 18px; margin: 6px 0; text-align: center; }
+  .wrap { width: 100%; max-width: 720px; display: flex; flex-direction: column; gap: 10px; }
+  #status {
+    background: var(--panel); border-radius: 12px; padding: 10px 14px;
+    font-size: 14px; line-height: 1.7;
+  }
+  #status .row { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 10px; }
+  #status b { font-weight: 600; }
+  .state-standing { color: #4ade80; }
+  .state-squatting { color: #facc15; }
+  .c-Excellent { color: var(--gold); font-weight: 700; }
+  .c-Great { color: #4ade80; font-weight: 700; }
+  .c-Fail { color: var(--red); font-weight: 700; }
+  #videoBox { position: relative; width: 100%; aspect-ratio: 3/4; background: #000; border-radius: 12px; overflow: hidden; }
+  #video { position: absolute; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #canvas { position: absolute; width: 100%; height: 100%; transform: scaleX(-1); }
+  #flash {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    font-size: 34px; font-weight: 800; pointer-events: none; text-shadow: 0 2px 8px #000;
+  }
+  #hint { position: absolute; bottom: 8px; left: 0; right: 0; text-align: center; font-size: 14px; color: #fde68a; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    flex: 1; min-width: 90px; padding: 13px 8px; font-size: 15px; font-weight: 600;
+    border: none; border-radius: 10px; cursor: pointer; color: #fff;
+  }
+  #btnStart { background: var(--green); }
+  #btnStart.running { background: #f59e0b; }
+  #btnExport { background: #2563eb; }
+  #btnCam { background: #4b5563; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  #log { font-size: 12px; color: #94a3b8; max-height: 90px; overflow-y: auto; white-space: pre-wrap; }
+  #report { background: var(--panel); border-radius: 12px; padding: 12px; font-size: 13px; white-space: pre-wrap; display: none; overflow-x: auto; }
+  .note { font-size: 11px; color: #94a3b8; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🏋️ 深蹲姿态识别辅助系统</h1>
+
+  <div id="status">
+    <div class="row">
+      <span>状态：<b id="sState" class="state-standing">待开始</b></span>
+      <span>识别：<b id="sTrack" style="color:#94a3b8">等待摄像头</b></span>
+    </div>
+    <div class="row">
+      <span>次数：<b id="sReps">0</b></span>
+      <span>优秀 <b id="sExc" class="c-Excellent">0</b> · 合格 <b id="sGre" class="c-Great">0</b> · 不合格 <b id="sFai" class="c-Fail">0</b></span>
+    </div>
+    <div class="row">
+      <span>深度 <b id="sDepth">0%</b></span>
+      <span>膝角 <b id="sKnee">--</b></span>
+      <span>前倾 <b id="sLean">--</b></span>
+    </div>
+  </div>
+
+  <div id="videoBox">
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <div id="flash"></div>
+    <div id="hint">按「开始运动」后，全身入镜做深蹲</div>
+  </div>
+
+  <div class="btns">
+    <button id="btnStart">开始运动</button>
+    <button id="btnExport" disabled>导出报告</button>
+    <button id="btnCam">切换摄像头</button>
+  </div>
+
+  <div id="log"></div>
+  <div class="note">需联网（加载识别模型）· 建议把手机横放或用支架固定，侧身入镜</div>
+  <pre id="report"></pre>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js"></script>
+<script>
+/* ============ 阈值参数 ============ */
+const SQUAT_DEPTH = 0.60, STAND_DEPTH = 0.80;
+const EXCELLENT_DEPTH = 0.10, GREAT_DEPTH = 0.50, TEMPO_EXCELLENT = 1.5;
+const LEAN_SLIGHT = 25, LEAN_HIGH = 40, KNEE_OVER_TOE = 0.05;
+const MIN_VIS = 0.7, CONFIRM_FRAMES = 3, MISS_FRAMES = 15;
+
+const R = {shoulder:12, hip:24, knee:26, ankle:28, foot:32};
+const L = {shoulder:11, hip:23, knee:25, ankle:27, foot:31};
+
+const CONNECTIONS = [[0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],[11,12],
+  [11,13],[13,15],[15,17],[15,19],[15,21],[17,19],[12,14],[14,16],[16,18],[16,20],[16,22],
+  [18,20],[11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28],[27,29],[28,30],[29,31],
+  [30,32],[27,31],[28,32]];
+
+const COLORS = {Excellent:"#e6a817", Great:"#4ade80", Fail:"#d93f3f"};
+
+/* ============ 工具函数 ============ */
+function angle3pt(a,b,c){
+  const ba=[a[0]-b[0],a[1]-b[1]], bc=[c[0]-b[0],c[1]-b[1]];
+  const dot=ba[0]*bc[0]+ba[1]*bc[1];
+  const n=Math.hypot(ba[0],ba[1])*Math.hypot(bc[0],bc[1]);
+  if(n<1e-6) return 0;
+  return Math.acos(Math.max(-1,Math.min(1,dot/n)))*180/Math.PI;
+}
+function torsoLean(shoulder,hip){
+  const v=[hip[0]-shoulder[0],hip[1]-shoulder[1]];
+  const n=Math.hypot(v[0],v[1]);
+  if(n<1e-6) return 0;
+  return Math.acos(Math.max(-1,Math.min(1,v[1]/n)))*180/Math.PI;
+}
+function gradeOf(minDepth,ratio,maxLean){
+  if(minDepth<=EXCELLENT_DEPTH && ratio>=TEMPO_EXCELLENT && maxLean<=LEAN_HIGH) return "Excellent";
+  if(minDepth<=GREAT_DEPTH) return "Great";
+  return "Fail";
+}
+function leanLevel(lean){
+  if(lean<=LEAN_SLIGHT) return "无";
+  if(lean<=LEAN_HIGH) return "轻微前倾";
+  return "过度前倾";
+}
+function tempoLabel(ratio){
+  if(ratio>=TEMPO_EXCELLENT) return "慢下快上";
+  if(ratio>=1.0) return "基本";
+  return "快下慢上";
+}
+const $=id=>document.getElementById(id);
+
+/* ============ 状态机 ============ */
+class SquatTracker {
+  constructor(){
+    this.reset();
+  }
+  reset(){
+    this.state="STANDING"; this.total=0; this.excellent=0; this.great=0; this.fail=0;
+    this.minDepth=1.0; this.minKnee=180; this.maxLean=0; this.maxKneeForward=0;
+    this.belowFrames=0; this.aboveFrames=0; this.missFrames=0;
+    this.descendStart=null; this.ascendEnd=null; this.bottomTime=null;
+    this.history=[]; this.lastGrade=""; this.lastMinDepth=1.0;
+  }
+  softReset(){
+    this.state="STANDING"; this.minDepth=1.0; this.minKnee=180;
+    this.maxLean=0; this.maxKneeForward=0; this.belowFrames=0; this.aboveFrames=0; this.missFrames=0;
+    this.descendStart=null; this.ascendEnd=null; this.bottomTime=null;
+  }
+  onMiss(){
+    this.missFrames++;
+    if(this.missFrames>=MISS_FRAMES) this.softReset();
+  }
+  update(relDepth, kneeAngle, lean, kneeForward, visAnkle, visShoulder){
+    let completed=false;
+    this.missFrames=0;
+    if(relDepth<SQUAT_DEPTH){
+      if(this.belowFrames===0 && this.state==="STANDING") this.descendStart=performance.now();
+      this.belowFrames++; this.aboveFrames=0;
+    } else if(relDepth>STAND_DEPTH){
+      if(this.aboveFrames===0 && this.state==="SQUATTING") this.ascendEnd=performance.now();
+      this.aboveFrames++; this.belowFrames=0;
+    } else { this.belowFrames=0; this.aboveFrames=0; }
+
+    if(this.state==="STANDING" && this.belowFrames>=CONFIRM_FRAMES){
+      this.state="SQUATTING"; this.bottomTime=null; this.maxLean=0; this.maxKneeForward=0;
+    } else if(this.state==="SQUATTING" && this.aboveFrames>=CONFIRM_FRAMES){
+      this.state="STANDING"; completed=true; this.total++;
+      const downS=(this.bottomTime&&this.descendStart)?(this.bottomTime-this.descendStart)/1000:0;
+      const upS=(this.ascendEnd&&this.bottomTime)?(this.ascendEnd-this.bottomTime)/1000:0;
+      const ratio = upS>0.05 ? downS/upS : 0;
+      const tempo = tempoLabel(ratio);
+      const leanLv = leanLevel(this.maxLean);
+      const g = gradeOf(this.minDepth, ratio, this.maxLean);
+      this.lastGrade=g; this.lastMinDepth=this.minDepth;
+      if(g==="Excellent") this.excellent++; else if(g==="Great") this.great++; else this.fail++;
+
+      const errors=[];
+      if(this.minDepth>GREAT_DEPTH) errors.push("深度不足");
+      if(this.maxLean>LEAN_HIGH) errors.push("过度前倾");
+      if(this.maxKneeForward>KNEE_OVER_TOE) errors.push("膝盖前移");
+
+      this.history.push({no:this.total, grade:g, minDepth:+this.minDepth.toFixed(3),
+        minKnee:+this.minKnee.toFixed(1), maxLean:+this.maxLean.toFixed(1), leanLevel:leanLv,
+        maxKneeForward:+this.maxKneeForward.toFixed(3), downS:+downS.toFixed(2),
+        upS:+upS.toFixed(2), ratio:+ratio.toFixed(2), tempo, errors});
+      this.descendStart=null; this.ascendEnd=null; this.bottomTime=null;
+      this.minDepth=1.0; this.minKnee=180; this.maxLean=0; this.maxKneeForward=0;
+    }
+
+    if(this.state==="SQUATTING" || this.belowFrames>0){
+      if(relDepth<this.minDepth){ this.minDepth=relDepth; this.bottomTime=performance.now(); }
+      if(visAnkle>MIN_VIS){ this.minKnee=Math.min(this.minKnee,kneeAngle); this.maxKneeForward=Math.max(this.maxKneeForward,kneeForward); }
+      if(visShoulder>MIN_VIS){ this.maxLean=Math.max(this.maxLean,lean); }
+    }
+    return completed;
+  }
+}
+
+/* ============ 全局 ============ */
+let poseLandmarker=null, video=$("video"), canvas=$("canvas"), ctx=canvas.getContext("2d");
+let tracker=new SquatTracker();
+let phase="IDLE"; let startTs=null, accumS=0;
+let flash=0, flashGrade="Great";
+let facingMode="user";
+let running=false;
+
+function log(msg){
+  const el=$("log"); el.textContent += msg+"\n"; el.scrollTop=el.scrollHeight;
+}
+
+async function loadPose(){
+  $("sTrack").textContent="加载模型中…";
+  const vision=await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts={ baseOptions:{ modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate:"GPU" },
+    runningMode:"VIDEO", numPoses:1,
+    minPoseDetectionConfidence:0.5, minPosePresenceConfidence:0.5, minTrackingConfidence:0.5 };
+  try {
+    poseLandmarker=await PoseLandmarker.createFromOptions(vision, opts);
+  } catch(e){
+    opts.baseOptions.delegate="CPU";
+    poseLandmarker=await PoseLandmarker.createFromOptions(vision, opts);
+  }
+  $("sTrack").textContent="模型已就绪";
+}
+
+async function startCamera(){
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode, width:{ideal:1280}, height:{ideal:720} }, audio:false });
+    video.srcObject=stream; await video.play();
+    $("sTrack").textContent="摄像头已开";
+  }catch(e){
+    $("sTrack").textContent="无法打开摄像头(请授权)";
+    log("摄像头错误: "+e.message);
+  }
+}
+
+video.addEventListener("loadedmetadata", ()=>{
+  canvas.width=video.videoWidth||640;
+  canvas.height=video.videoHeight||480;
+});
+
+function switchCamera(){
+  facingMode = facingMode==="user" ? "environment" : "user";
+  if(video.srcObject){ video.srcObject.getTracks().forEach(t=>t.stop()); }
+  startCamera();
+}
+
+/* ============ 每帧处理 ============ */
+function process(landmarks){
+  const W=canvas.width, H=canvas.height;
+  const lm=landmarks[0];
+  const pt=i=>[lm[i].x*W, lm[i].y*H];
+
+  const visR=Math.min(lm[R.hip].visibility, lm[R.knee].visibility);
+  const visL=Math.min(lm[L.hip].visibility, lm[L.knee].visibility);
+  const useR=visR>=visL;
+  const idx=useR?R:L;
+  const shoulder=pt(idx.shoulder), hip=pt(idx.hip), knee=pt(idx.knee), ankle=pt(idx.ankle), foot=pt(idx.foot);
+  const vis=Math.min(lm[idx.hip].visibility, lm[idx.knee].visibility);
+  const visAnkle=lm[idx.ankle].visibility, visShoulder=lm[idx.shoulder].visibility;
+
+  // 画骨架
+  ctx.clearRect(0,0,W,H);
+  ctx.strokeStyle="rgba(255,255,255,0.85)"; ctx.lineWidth=3;
+  for(const [a,b] of CONNECTIONS){
+    ctx.beginPath();
+    ctx.moveTo(lm[a].x*W, lm[a].y*H); ctx.lineTo(lm[b].x*W, lm[b].y*H); ctx.stroke();
+  }
+  for(const p of lm){ ctx.beginPath(); ctx.arc(p.x*W,p.y*H,4,0,7); ctx.fillStyle="#4ade80"; ctx.fill(); }
+
+  if(vis<MIN_VIS){
+    tracker.onMiss();
+    $("sTrack").textContent="未检测到(请全身入镜)";
+    return;
+  }
+  $("sTrack").textContent="识别中";
+
+  const thigh=Math.hypot(hip[0]-knee[0], hip[1]-knee[1]);
+  const relDepth = thigh>1e-3 ? (knee[1]-hip[1])/thigh : 1.0;
+  const kneeAngle=angle3pt(hip,knee,ankle);
+  const lean=torsoLean(shoulder,hip);
+  const kneeForward=(knee[0]-foot[0])/W;
+  const completed=tracker.update(relDepth,kneeAngle,lean,kneeForward,visAnkle,visShoulder);
+
+  if(completed){ flash=40; flashGrade=tracker.lastGrade; log(`第 ${tracker.total} 个 → ${tracker.lastGrade}`); }
+
+  // 关键角度标注
+  ctx.font="15px sans-serif"; ctx.lineWidth=2;
+  const depthPct=Math.max(0,Math.min(100,(1-relDepth)*100));
+  ctx.strokeStyle="#facc15"; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(shoulder[0],shoulder[1]); ctx.lineTo(hip[0],hip[1]); ctx.lineTo(knee[0],knee[1]); ctx.lineTo(ankle[0],ankle[1]); ctx.stroke();
+  ctx.fillStyle = relDepth<=GREAT_DEPTH ? "#4ade80" : "#f87171";
+  ctx.fillText("膝角 "+kneeAngle.toFixed(0), knee[0]+12, knee[1]-12);
+  ctx.fillStyle = lean<=LEAN_HIGH ? "#4ade80" : "#f87171";
+  ctx.fillText("前倾 "+lean.toFixed(0), shoulder[0]+12, shoulder[1]-12);
+
+  // 状态栏
+  $("sState").textContent = tracker.state==="SQUATTING" ? "下蹲" : "站立";
+  $("sState").className = tracker.state==="SQUATTING" ? "state-squatting" : "state-standing";
+  $("sReps").textContent=tracker.total;
+  $("sExc").textContent=tracker.excellent; $("sGre").textContent=tracker.great; $("sFai").textContent=tracker.fail;
+  $("sDepth").textContent=depthPct.toFixed(0)+"%";
+  $("sKnee").textContent = visAnkle>MIN_VIS ? kneeAngle.toFixed(0)+"°" : "--";
+  $("sLean").textContent = visShoulder>MIN_VIS ? lean.toFixed(0)+"°" : "--";
+}
+
+async function loop(){
+  if(!running) return;
+  if(poseLandmarker && video.readyState>=2){
+    const res=poseLandmarker.detectForVideo(video, performance.now());
+    if(res.landmarks && res.landmarks.length>0){
+      process(res.landmarks);
+      if(flash>0){
+        const f=$("flash"); f.textContent=flashGrade+" +1"; f.style.color=COLORS[flashGrade];
+        flash--;
+      } else { $("flash").textContent=""; }
+    } else {
+      tracker.onMiss(); $("sTrack").textContent="未检测到(请全身入镜)";
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+/* ============ 控制 ============ */
+$("btnStart").onclick=()=>{
+  if(phase==="IDLE"){
+    tracker=new SquatTracker(); accumS=0;
+    phase="RUNNING"; startTs=performance.now();
+    $("btnStart").textContent="结束运动"; $("btnStart").classList.add("running");
+    $("hint").textContent="运动进行中，做完按「结束运动」";
+    log("开始运动");
+  } else if(phase==="RUNNING"){
+    if(startTs) accumS+=(performance.now()-startTs)/1000;
+    startTs=null; phase="FINISHED";
+    $("btnStart").textContent="再来一组"; $("btnStart").classList.remove("running");
+    $("btnExport").disabled=false;
+    $("hint").textContent="已结束，可「导出报告」或「再来一组」";
+    log(`结束运动，用时 ${accumS.toFixed(1)} 秒`);
+  } else { // FINISHED -> 再来一组
+    tracker=new SquatTracker(); accumS=0;
+    phase="RUNNING"; startTs=performance.now();
+    $("btnStart").textContent="结束运动"; $("btnStart").classList.add("running");
+    $("btnExport").disabled=true;
+    $("hint").textContent="运动进行中";
+  }
+};
+$("btnCam").onclick=switchCamera;
+$("btnExport").onclick=()=>{ exportReport(); };
+
+function exportReport(){
+  const his=tracker.history, total=tracker.total;
+  const passRate=total?(tracker.excellent+tracker.great)/total*100:0;
+  const avg=k=>total?his.reduce((s,r)=>s+r[k],0)/total:0;
+  const active=his.reduce((s,r)=>s+r.downS+r.upS,0);
+  const slowFast=his.filter(r=>r.tempo==="慢下快上").length;
+  const leanCount={"无":0,"轻微前倾":0,"过度前倾":0};
+  his.forEach(r=>{ leanCount[r.leanLevel]++; });
+
+  const lines=[];
+  lines.push("=".repeat(46));
+  lines.push("           深蹲运动记录报告");
+  lines.push("=".repeat(46));
+  lines.push(`日期时间 : ${new Date().toLocaleString()}`);
+  lines.push(`运动时长 : ${Math.floor(accumS/60)} 分 ${Math.round(accumS%60)} 秒`);
+  lines.push(`累计动作 : ${active.toFixed(1)} 秒`);
+  lines.push("");
+  lines.push("【基本汇总】");
+  lines.push(`  总次数   : ${total}`);
+  lines.push(`  优秀 ${tracker.excellent} · 合格 ${tracker.great} · 不合格 ${tracker.fail}`);
+  lines.push(`  达标率   : ${passRate.toFixed(1)}%`);
+  lines.push("");
+  lines.push("【动作分析】");
+  lines.push(`  平均深度 : ${avg('minDepth').toFixed(2)}   (越小越深)`.replace('NaN','--'));
+  lines.push(`  平均膝角 : ${avg('minKnee').toFixed(0)} 度`);
+  lines.push(`  前倾分布 : 无 ${leanCount['无']} · 轻微 ${leanCount['轻微前倾']} · 过度 ${leanCount['过度前倾']}`);
+  lines.push("");
+  lines.push("【节奏分析】(慢下快上)");
+  lines.push(`  平均下蹲 : ${avg('downS').toFixed(2)} 秒`);
+  lines.push(`  平均起身 : ${avg('upS').toFixed(2)} 秒`);
+  lines.push(`  慢下快上达标 : ${slowFast}/${total} 次`);
+  lines.push("");
+  lines.push("【每次动作明细】");
+  lines.push(" # 等级       深度   前倾   膝角  下蹲s 起身s 节奏   错误");
+  his.forEach(r=>{
+    lines.push(`${String(r.no).padStart(2)} ${r.grade.padEnd(10)} ${r.minDepth.toFixed(2).padStart(5)}  ${r.leanLevel.padEnd(5)} ${String(r.minKnee).padStart(4)}  ${r.downS.toFixed(2).padStart(5)} ${r.upS.toFixed(2).padStart(5)} ${r.tempo.padEnd(5)} ${r.errors.join('、')||'无'}`);
+  });
+  lines.push("=".repeat(46));
+  lines.push("说明: Excellent = 深度<=0.10 且 慢下快上 且 前倾<=40度");
+
+  const txt=lines.join("\n");
+  const rep=$("report"); rep.textContent=txt; rep.style.display="block";
+
+  // 下载 txt
+  const blob=new Blob([txt],{type:"text/plain;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=`运动记录_${Date.now()}.txt`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  log("已导出报告 txt");
+}
+
+/* ============ 启动 ============ */
+(async function(){
+  await loadPose();
+  await startCamera();
+  canvas.width=video.videoWidth||640; canvas.height=video.videoHeight||480;
+  running=true; loop();
+})();
+</script>
+</body>
+</html>
