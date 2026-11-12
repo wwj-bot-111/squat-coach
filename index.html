@@ -43,6 +43,7 @@
   #btnStart.running { background: #f59e0b; }
   #btnExport { background: #2563eb; }
   #btnCam { background: #4b5563; }
+  #btnFile { background: #7c3aed; }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
   #log { font-size: 12px; color: #94a3b8; max-height: 90px; overflow-y: auto; white-space: pre-wrap; }
   #report { background: var(--panel); border-radius: 12px; padding: 12px; font-size: 13px; white-space: pre-wrap; display: none; overflow-x: auto; }
@@ -80,15 +81,17 @@
     <button id="btnStart">开始运动</button>
     <button id="btnExport" disabled>导出报告</button>
     <button id="btnCam">切换摄像头</button>
+    <button id="btnFile">📁 选择视频文件</button>
   </div>
+  <input type="file" id="fileInput" accept="video/*" style="display:none">
 
   <div id="log"></div>
-  <div class="note">需联网（加载识别模型）· 建议把手机横放或用支架固定，侧身入镜</div>
+  <div class="note">离线可用（识别模型已内置）· 建议把手机横放或用支架固定，侧身入镜</div>
   <pre id="report"></pre>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js"></script>
-<script>
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from "./mediapipe/vision_bundle.js";
 /* ============ 阈值参数 ============ */
 const SQUAT_DEPTH = 0.60, STAND_DEPTH = 0.80;
 const EXCELLENT_DEPTH = 0.10, GREAT_DEPTH = 0.50, TEMPO_EXCELLENT = 1.5;
@@ -135,6 +138,35 @@ function tempoLabel(ratio){
   return "快下慢上";
 }
 const $=id=>document.getElementById(id);
+
+/* ============ 语音播报 ============ */
+const SPEECH_ERRORS = {
+  "GO LOWER":"再蹲低一点",
+  "KNEES TOO FAR FORWARD":"膝盖前移过多，膝盖不要超过脚尖",
+  "TORSO LEANING TOO MUCH":"保持挺胸，上身直立"
+};
+const SPEECH_GRADE = {Excellent:"漂亮，动作标准", Great:"做得好", Fail:"这次动作不到位，注意纠正"};
+let lastSpoken={};
+
+function speak(text){
+  if(!text || !('speechSynthesis' in window)) return;
+  const now=Date.now();
+  if(now-(lastSpoken[text]||0) < 3500) return;   // 同一口令 3.5s 内不重复
+  lastSpoken[text]=now;
+  try{
+    window.speechSynthesis.cancel();
+    const u=new SpeechSynthesisUtterance(text);
+    u.lang="zh-CN"; u.rate=1.0;
+    const vs=window.speechSynthesis.getVoices();
+    const zh=vs.find(v=>/zh|chinese/i.test((v.lang||"")+(v.name||"")));
+    if(zh) u.voice=zh;
+    window.speechSynthesis.speak(u);
+  }catch(e){}
+}
+if('speechSynthesis' in window){
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.onvoiceschanged=()=>window.speechSynthesis.getVoices();
+}
 
 /* ============ 状态机 ============ */
 class SquatTracker {
@@ -211,33 +243,46 @@ let flash=0, flashGrade="Great";
 let facingMode="user";
 let running=false;
 
+/* 骨架平滑：EMA 指数滑动平均，减小线条抖动 */
+let smoothLm=null;
+const SMOOTH=0.35;
+const MAX_JUMP=0.04;   // 单帧最大位移(归一化)，超过视为遮挡错误并钳制
+
 function log(msg){
   const el=$("log"); el.textContent += msg+"\n"; el.scrollTop=el.scrollHeight;
 }
 
 async function loadPose(){
   $("sTrack").textContent="加载模型中…";
-  const vision=await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-  const opts={ baseOptions:{ modelAssetPath:
-      "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-      delegate:"GPU" },
-    runningMode:"VIDEO", numPoses:1,
-    minPoseDetectionConfidence:0.5, minPosePresenceConfidence:0.5, minTrackingConfidence:0.5 };
-  try {
-    poseLandmarker=await PoseLandmarker.createFromOptions(vision, opts);
-  } catch(e){
-    opts.baseOptions.delegate="CPU";
-    poseLandmarker=await PoseLandmarker.createFromOptions(vision, opts);
+  try{
+    const vision=await FilesetResolver.forVisionTasks(
+      "mediapipe/wasm");
+    const opts={ baseOptions:{ modelAssetPath:
+        "mediapipe/pose_landmarker_full.task",
+        delegate:"GPU" },
+      runningMode:"VIDEO", numPoses:1,
+      minPoseDetectionConfidence:0.5, minPosePresenceConfidence:0.5, minTrackingConfidence:0.5 };
+    try {
+      poseLandmarker=await PoseLandmarker.createFromOptions(vision, opts);
+    } catch(e){
+      opts.baseOptions.delegate="CPU";
+      poseLandmarker=await PoseLandmarker.createFromOptions(vision, opts);
+    }
+    $("sTrack").textContent="模型已就绪";
+  }catch(e){
+    poseLandmarker=null;
+    $("sTrack").textContent="模型加载失败(需联网)";
+    log("模型加载失败: "+e.message);
   }
-  $("sTrack").textContent="模型已就绪";
 }
 
 async function startCamera(){
   try{
     const stream=await navigator.mediaDevices.getUserMedia({
       video:{ facingMode, width:{ideal:1280}, height:{ideal:720} }, audio:false });
-    video.srcObject=stream; await video.play();
+    video.src=""; video.srcObject=stream; await video.play();
+    setMirror(true);
+    smoothLm=null;
     $("sTrack").textContent="摄像头已开";
   }catch(e){
     $("sTrack").textContent="无法打开摄像头(请授权)";
@@ -248,6 +293,17 @@ async function startCamera(){
 video.addEventListener("loadedmetadata", ()=>{
   canvas.width=video.videoWidth||640;
   canvas.height=video.videoHeight||480;
+  // 关键：让容器跟随视频真实宽高比，避免 object-fit 裁切导致骨架错位
+  const box=$("videoBox");
+  if(video.videoWidth && video.videoHeight){
+    box.style.aspectRatio=(video.videoWidth/video.videoHeight).toFixed(4);
+  }
+});
+video.addEventListener("ended", ()=>{
+  if(isVideoFile()){
+    $("sTrack").textContent="视频播放完毕";
+    $("hint").textContent="视频已播完，点「开始运动」重播，或重新「选择视频文件」";
+  }
 });
 
 function switchCamera(){
@@ -256,10 +312,56 @@ function switchCamera(){
   startCamera();
 }
 
+/* 视频文件：镜像开关 + 选择文件 */
+function setMirror(on){
+  const t = on ? "scaleX(-1)" : "none";
+  video.style.transform = t;
+  canvas.style.transform = t;
+}
+function isVideoFile(){
+  return !!video.src && !video.srcObject;
+}
+async function handleFile(e){
+  const file = e.target.files && e.target.files[0];
+  if(!file) return;
+  // 关闭摄像头，改用视频文件
+  if(video.srcObject){ video.srcObject.getTracks().forEach(t=>t.stop()); video.srcObject=null; }
+  video.src = URL.createObjectURL(file);
+  setMirror(false);
+  // 重置计数与状态
+  tracker = new SquatTracker(); accumS=0; startTs=null; phase="IDLE"; smoothLm=null;
+  $("btnStart").textContent="开始运动"; $("btnStart").classList.remove("running");
+  $("btnExport").disabled=true;
+  $("hint").textContent="已载入视频，点「开始运动」后自动识别";
+  $("sTrack").textContent="视频已载入";
+  log("已选择视频: "+file.name);
+  try{ await video.play(); }
+  catch(err){ $("sTrack").textContent="视频无法播放"; log("播放错误: "+err.message); }
+  e.target.value="";   // 允许再次选择同一文件
+}
+
 /* ============ 每帧处理 ============ */
+function smoothLandmarks(raw){
+  if(!smoothLm || smoothLm.length!==raw.length){
+    smoothLm = raw.map(p=>({x:p.x, y:p.y, z:p.z, visibility:p.visibility}));
+    return smoothLm;
+  }
+  for(let i=0;i<raw.length;i++){
+    const s=smoothLm[i], r=raw[i];
+    let dx=r.x-s.x, dy=r.y-s.y;
+    const d=Math.hypot(dx,dy);
+    if(d>MAX_JUMP){ const k=MAX_JUMP/d; dx*=k; dy*=k; }  // 遮挡大跳变：钳制移动
+    s.x += SMOOTH*dx;
+    s.y += SMOOTH*dy;
+    s.z += SMOOTH*(r.z-s.z);
+    s.visibility = r.visibility;
+  }
+  return smoothLm;
+}
+
 function process(landmarks){
   const W=canvas.width, H=canvas.height;
-  const lm=landmarks[0];
+  const lm=smoothLandmarks(landmarks[0]);
   const pt=i=>[lm[i].x*W, lm[i].y*H];
 
   const visR=Math.min(lm[R.hip].visibility, lm[R.knee].visibility);
@@ -293,7 +395,14 @@ function process(landmarks){
   const kneeForward=(knee[0]-foot[0])/W;
   const completed=tracker.update(relDepth,kneeAngle,lean,kneeForward,visAnkle,visShoulder);
 
-  if(completed){ flash=40; flashGrade=tracker.lastGrade; log(`第 ${tracker.total} 个 → ${tracker.lastGrade}`); }
+  if(completed){ flash=40; flashGrade=tracker.lastGrade; log(`第 ${tracker.total} 个 → ${tracker.lastGrade}`); speak(SPEECH_GRADE[tracker.lastGrade]||""); }
+
+  // 错误语音播报（实时）
+  const errors=[];
+  if(tracker.state==="SQUATTING" && relDepth>GREAT_DEPTH) errors.push("GO LOWER");
+  if(tracker.state==="SQUATTING" && visAnkle>MIN_VIS && kneeForward>KNEE_OVER_TOE) errors.push("KNEES TOO FAR FORWARD");
+  if(visShoulder>MIN_VIS && lean>LEAN_HIGH) errors.push("TORSO LEANING TOO MUCH");
+  errors.forEach(e=>speak(SPEECH_ERRORS[e]||""));
 
   // 关键角度标注
   ctx.font="15px sans-serif"; ctx.lineWidth=2;
@@ -317,23 +426,39 @@ function process(landmarks){
 
 async function loop(){
   if(!running) return;
-  if(poseLandmarker && video.readyState>=2){
-    const res=poseLandmarker.detectForVideo(video, performance.now());
-    if(res.landmarks && res.landmarks.length>0){
-      process(res.landmarks);
-      if(flash>0){
-        const f=$("flash"); f.textContent=flashGrade+" +1"; f.style.color=COLORS[flashGrade];
-        flash--;
-      } else { $("flash").textContent=""; }
-    } else {
-      tracker.onMiss(); $("sTrack").textContent="未检测到(请全身入镜)";
+  if(poseLandmarker && video.readyState>=2 && !(isVideoFile() && video.paused)){
+    try{
+      const res=poseLandmarker.detectForVideo(video, performance.now());
+      if(res.landmarks && res.landmarks.length>0){
+        process(res.landmarks);
+        if(flash>0){
+          const f=$("flash"); f.textContent=flashGrade+" +1"; f.style.color=COLORS[flashGrade];
+          flash--;
+        } else { $("flash").textContent=""; }
+      } else {
+        tracker.onMiss(); $("sTrack").textContent="未检测到(请全身入镜)";
+        smoothLm=null;
+      }
+    }catch(err){
+      $("sTrack").textContent="识别出错";
+      log("识别出错: "+err.message);
     }
   }
   requestAnimationFrame(loop);
 }
 
 /* ============ 控制 ============ */
-$("btnStart").onclick=()=>{
+$("btnStart").onclick=async ()=>{
+  if(isVideoFile() && video.ended){
+    video.currentTime=0;
+    tracker=new SquatTracker(); accumS=0;
+    phase="RUNNING"; startTs=performance.now();
+    $("btnStart").textContent="结束运动"; $("btnStart").classList.add("running");
+    $("btnExport").disabled=true;
+    $("hint").textContent="视频重新播放中";
+    try{ await video.play(); }catch(e){}
+    return;
+  }
   if(phase==="IDLE"){
     tracker=new SquatTracker(); accumS=0;
     phase="RUNNING"; startTs=performance.now();
@@ -356,6 +481,8 @@ $("btnStart").onclick=()=>{
   }
 };
 $("btnCam").onclick=switchCamera;
+$("btnFile").onclick=()=>$("fileInput").click();
+$("fileInput").addEventListener("change", handleFile);
 $("btnExport").onclick=()=>{ exportReport(); };
 
 function exportReport(){
